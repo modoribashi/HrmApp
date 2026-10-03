@@ -17,6 +17,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -102,6 +104,10 @@ fun MainScreen() {
     val isSubscribed = subscribedState?.value ?: false
     val sensorState = hrmService?.sensorStatus?.collectAsState(initial = "Waiting for heart rate...")
     val sensorStatus = sensorState?.value ?: "Waiting for heart rate..."
+    val pairingState = hrmService?.pairingStatus?.collectAsState(initial = "Connect a receiver before pairing")
+    val pairingStatus = pairingState?.value ?: "Connect a receiver before pairing"
+    val canPairState = hrmService?.canPairReceiver?.collectAsState(initial = false)
+    val canPairReceiver = canPairState?.value ?: false
 
     val isMeasuringState = hrmService?.isMeasuring?.collectAsState(initial = false)
     val isMeasuring = isMeasuringState?.value ?: false
@@ -179,7 +185,8 @@ fun MainScreen() {
 
         if (canStart) {
             Column(
-                modifier = Modifier.fillMaxSize(),
+                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp, vertical = 32.dp),
                 verticalArrangement = Arrangement.Center,
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
@@ -218,6 +225,15 @@ fun MainScreen() {
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(onClick = { HrmForegroundService.stop(context) }) {
                         Text("Stop")
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Address pairing test", style = MaterialTheme.typography.titleSmall,
+                        color = Color.White, textAlign = TextAlign.Center)
+                    Text(pairingStatus, style = MaterialTheme.typography.bodySmall,
+                        color = Color.LightGray, textAlign = TextAlign.Center)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Button(onClick = { hrmService?.pairReceiver() }, enabled = canPairReceiver) {
+                        Text("Pair receiver")
                     }
                 } else {
                     Button(onClick = { HrmForegroundService.start(context) }) {
