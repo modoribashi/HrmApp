@@ -1,81 +1,135 @@
 package com.stanleymasinde.hrmapp.sensor
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.health.services.client.HealthServices
 import androidx.health.services.client.MeasureCallback
-import androidx.health.services.client.data.Availability
-import androidx.health.services.client.data.DataPointContainer
-import androidx.health.services.client.data.DataType
-import androidx.health.services.client.data.DataTypeAvailability
-import androidx.health.services.client.data.DeltaDataType
+import androidx.health.services.client.data.*
 
+/** Complete unregister before registering again after a rapid stop/start. */
 class HrDataSource(
-    private val context: Context,
+    context: Context,
     private val onHeartRateChanged: (Int) -> Unit,
-    private val onError: (String) -> Unit,
+    private val onRegistrationChanged: (Boolean) -> Unit,
+    private val onStatusChanged: (String) -> Unit,
     private val onAvailabilityChanged: (Boolean) -> Unit
 ) {
     private val measureClient = HealthServices.getClient(context).measureClient
-    private var isRegistered = false
+    private val executor = ContextCompat.getMainExecutor(context)
+    private val handler = Handler(Looper.getMainLooper())
+    private var wanted = false
+    private var current: Callback? = null
+    private val retry = Runnable { if (wanted && current == null) register() }
 
-    private val heartRateCallback = object : MeasureCallback {
-        override fun onAvailabilityChanged(dataType: DeltaDataType<*, *>, availability: Availability) {
-            Log.d(TAG, "Availability changed: $availability")
-            if (dataType == DataType.HEART_RATE_BPM) {
-                val available = availability == DataTypeAvailability.AVAILABLE
-                onAvailabilityChanged(available)
-                if (!available) {
-                    onError("Heart rate sensor unavailable")
-                }
+    private inner class Callback : MeasureCallback {
+        var registered = false
+        var stopping = false
+
+        override fun onRegistered() {
+            if (current !== this) return
+            registered = true
+            Log.d(TAG, "Heart rate callback registered")
+            if (wanted) onRegistrationChanged(true) else unregister(this)
+        }
+
+        override fun onRegistrationFailed(throwable: Throwable) {
+            if (current !== this) return
+            current = null
+            Log.e(TAG, "Heart rate registration failed", throwable)
+            onRegistrationChanged(false)
+            onAvailabilityChanged(false)
+            if (wanted) {
+                onStatusChanged("Sensor registration failed; check permissions")
+                handler.postDelayed(retry, 10_000L)
             }
         }
 
+        override fun onAvailabilityChanged(dataType: DeltaDataType<*, *>, availability: Availability) {
+            if (current !== this || !wanted || stopping || dataType != DataType.HEART_RATE_BPM) return
+            Log.d(TAG, "Availability: $availability")
+            onAvailabilityChanged(availability == DataTypeAvailability.AVAILABLE)
+            onStatusChanged(when (availability) {
+                DataTypeAvailability.AVAILABLE -> "Waiting for heart rate..."
+                DataTypeAvailability.ACQUIRING -> "Acquiring heart rate..."
+                DataTypeAvailability.UNAVAILABLE_DEVICE_OFF_BODY -> "Wear the watch snugly"
+                else -> "Heart rate sensor unavailable"
+            })
+        }
+
         override fun onDataReceived(data: DataPointContainer) {
-            val heartRatePoints = data.getData(DataType.HEART_RATE_BPM)
-            heartRatePoints.lastOrNull()?.let { point ->
-                val bpm = point.value.toInt()
-                Log.d(TAG, "Data received: $bpm BPM")
-                onAvailabilityChanged(true)
-                onHeartRateChanged(bpm)
+            if (current !== this || !wanted || stopping) return
+            data.getData(DataType.HEART_RATE_BPM).lastOrNull()?.value?.let { value ->
+                if (value.isFinite() && value > 0 && value <= 255) {
+                    onAvailabilityChanged(true)
+                    onStatusChanged("Sensor active")
+                    onHeartRateChanged(value.toInt())
+                }
             }
         }
     }
 
-    fun start(): Boolean {
-        if (isRegistered) return true
+    fun start() {
+        wanted = true
+        handler.removeCallbacks(retry)
+        if (current == null) register()
+    }
+
+    private fun register() {
+        if (!wanted || current != null) return
+        onAvailabilityChanged(false)
+        onStatusChanged("Starting heart rate sensor...")
+        val callback = Callback()
+        current = callback
         try {
-            measureClient.registerMeasureCallback(
-                DataType.HEART_RATE_BPM,
-                heartRateCallback
-            )
-            isRegistered = true
-            onAvailabilityChanged(false)
-            Log.d(TAG, "Heart rate callback registered")
-            return true
+            measureClient.registerMeasureCallback(DataType.HEART_RATE_BPM, executor, callback)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to register heart rate callback", e)
-            onError("Unable to read heart rate data")
-            return false
+            callback.onRegistrationFailed(e)
         }
     }
 
     fun stop() {
-        if (!isRegistered) return
+        wanted = false
+        handler.removeCallbacks(retry)
+        onRegistrationChanged(false)
+        onAvailabilityChanged(false)
+        // If registration is pending, onRegistered will finish this stop.
+        current?.takeIf { it.registered }?.let { unregister(it) }
+    }
+
+    private fun unregister(callback: Callback) {
+        if (callback.stopping) return
+        callback.stopping = true
         try {
-            measureClient.unregisterMeasureCallbackAsync(
-                DataType.HEART_RATE_BPM,
-                heartRateCallback
-            )
-            isRegistered = false
-            onAvailabilityChanged(false)
-            Log.d(TAG, "Heart rate callback unregistered")
+            val future = measureClient.unregisterMeasureCallbackAsync(DataType.HEART_RATE_BPM, callback)
+            future.addListener({
+                try {
+                    future.get()
+                    if (current === callback) {
+                        current = null
+                        Log.d(TAG, "Heart rate callback unregistered")
+                        if (wanted) register()
+                    }
+                } catch (e: Exception) {
+                    unregisterFailed(callback, e)
+                }
+            }, executor)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to unregister heart rate callback", e)
+            unregisterFailed(callback, e)
         }
     }
 
-    companion object {
-        private const val TAG = "HrDataSource"
+    private fun unregisterFailed(callback: Callback, error: Exception) {
+        Log.w(TAG, "Unable to unregister sensor", error)
+        if (current !== callback) return
+        callback.stopping = false
+        onStatusChanged("Retrying sensor cleanup...")
+        // Never overlap a new registration with an unresolved old one.
+        handler.postDelayed({ if (current === callback) unregister(callback) }, 5_000L)
     }
+
+    companion object { private const val TAG = "HrDataSource" }
 }
+
