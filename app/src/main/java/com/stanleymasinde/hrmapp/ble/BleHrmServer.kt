@@ -1,223 +1,317 @@
 package com.stanleymasinde.hrmapp.ble
 
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
-import android.bluetooth.BluetoothGattServer
-import android.bluetooth.BluetoothGattServerCallback
-import android.bluetooth.BluetoothGattService
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.AdvertiseCallback
-import android.bluetooth.le.AdvertiseData
-import android.bluetooth.le.AdvertiseSettings
-import android.bluetooth.le.BluetoothLeAdvertiser
+import android.bluetooth.*
+import android.bluetooth.le.*
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
 import android.util.Log
+import androidx.core.content.ContextCompat
 
+/** Serialize lifecycle and GATT callbacks on the main looper. */
+@SuppressLint("MissingPermission")
 class BleHrmServer(private val context: Context) {
-
-    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-    private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager.adapter
-    private var bluetoothGattServer: BluetoothGattServer? = null
-    private var bluetoothLeAdvertiser: BluetoothLeAdvertiser? = bluetoothAdapter?.bluetoothLeAdvertiser
-
-    private var connectedDevice: BluetoothDevice? = null
-    private var notificationsEnabled = false
-
+    private val manager = context.getSystemService(BluetoothManager::class.java)
+    private val adapter get() = manager.adapter
+    private val handler = Handler(Looper.getMainLooper())
+    private val preferences = context.getSharedPreferences("bonded_hr_cccd", Context.MODE_PRIVATE)
+    private val subscriptions = ReceiverSubscriptions()
+    private val devices = linkedMapOf<String, BluetoothDevice>()
+    private var server: BluetoothGattServer? = null
+    private var advertiser: BluetoothLeAdvertiser? = null
+    private var advertisement: AdvertiseCallback? = null
+    private var generation = 0
+    private var ready = false
+    private var wanted = false
+    private var receiverRegistered = false
+    private var retryCount = 0
+    private var lastDemand = false
+    private val retry = Runnable { ensureServerAndAdvertising() }
     var onConnectionStateChanged: ((Boolean) -> Unit)? = null
     var onAdvertisingStateChanged: ((Boolean) -> Unit)? = null
     var onMeasurementDemandChanged: ((Boolean) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
 
-    private val gattServerCallback = object : BluetoothGattServerCallback() {
-        @SuppressLint("MissingPermission")
-        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
-            super.onConnectionStateChange(device, status, newState)
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.d(TAG, "Device connected: ${device.address}")
-                connectedDevice = device
-                onConnectionStateChanged?.invoke(true)
-                // Stop advertising once connected to save power/avoid multiple connections
-                stopAdvertising()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                Log.d(TAG, "Device disconnected: ${device.address}")
-                connectedDevice = null
-                notificationsEnabled = false
-                onConnectionStateChanged?.invoke(false)
-                onMeasurementDemandChanged?.invoke(false)
-                // Restart advertising so other devices (or the same one) can reconnect
-                startAdvertising()
+    private val bluetoothStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
+                BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
+                    releaseServer()
+                    if (wanted) onError?.invoke("Waiting for Bluetooth")
+                }
+                BluetoothAdapter.STATE_ON -> if (wanted) ensureServerAndAdvertising()
             }
         }
+    }
 
-        override fun onDescriptorWriteRequest(
-            device: BluetoothDevice,
-            requestId: Int,
-            descriptor: BluetoothGattDescriptor,
-            preparedWrite: Boolean,
-            responseNeeded: Boolean,
-            offset: Int,
-            value: ByteArray
-        ) {
-            super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
-            if (HrmUuids.CCCD == descriptor.uuid) {
-                notificationsEnabled = value.contentEquals(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                Log.d(TAG, "Notifications enabled: $notificationsEnabled")
-                onMeasurementDemandChanged?.invoke(notificationsEnabled)
+    fun start(): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        wanted = true
+        subscriptions.running = true
+        try {
+            if (!receiverRegistered) {
+                ContextCompat.registerReceiver(context, bluetoothStateReceiver,
+                    IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED), ContextCompat.RECEIVER_EXPORTED)
+                receiverRegistered = true
+            }
+            publishConnectionAndDemand()
+            ensureServerAndAdvertising()
+            return true
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Bluetooth permission missing", e)
+            onError?.invoke("Grant Nearby devices permission")
+            wanted = false
+            subscriptions.running = false
+            publishConnectionAndDemand()
+            return false
+        }
+    }
 
-                if (responseNeeded) {
-                    try {
-                        bluetoothGattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, value)
-                    } catch (e: SecurityException) {
-                        Log.e(TAG, "SecurityException while sending response: ${e.message}")
-                    }
+    /** Pause without deleting the service/CCCD that a connected receiver is still using. */
+    fun stop() {
+        wanted = false
+        subscriptions.running = false
+        handler.removeCallbacks(retry)
+        stopAdvertising()
+        publishConnectionAndDemand()
+    }
+
+    fun close() {
+        stop()
+        releaseServer()
+        if (receiverRegistered) {
+            context.unregisterReceiver(bluetoothStateReceiver)
+            receiverRegistered = false
+        }
+    }
+
+    private fun ensureServerAndAdvertising() {
+        try { ensureServerAndAdvertisingInternal() }
+        catch (e: RuntimeException) {
+            Log.w(TAG, "Bluetooth stack not ready", e)
+            releaseServer()
+            scheduleRetry("Waiting for Bluetooth access")
+        }
+    }
+
+    private fun ensureServerAndAdvertisingInternal() {
+        if (!wanted) return
+        if (adapter?.isEnabled != true) {
+            onError?.invoke("Waiting for Bluetooth")
+            return
+        }
+        if (server == null) {
+            val session = ++generation
+            ready = false
+            server = manager.openGattServer(context, callback(session))
+            val service = BluetoothGattService(HrmUuids.HEART_RATE_SERVICE,
+                BluetoothGattService.SERVICE_TYPE_PRIMARY)
+            val measurement = BluetoothGattCharacteristic(HrmUuids.HR_MEASUREMENT,
+                BluetoothGattCharacteristic.PROPERTY_NOTIFY, 0)
+            measurement.addDescriptor(BluetoothGattDescriptor(HrmUuids.CCCD,
+                BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE))
+            service.addCharacteristic(measurement)
+            if (server?.addService(service) != true) {
+                releaseServer()
+                scheduleRetry("Unable to publish heart rate service")
+            }
+            // addService is asynchronous: advertise only after onServiceAdded.
+            return
+        }
+        if (ready) startAdvertising()
+    }
+
+    private fun callback(session: Int) = object : BluetoothGattServerCallback() {
+        private fun dispatch(action: () -> Unit) {
+            handler.post { if (session == generation && server != null) action() }
+        }
+        override fun onServiceAdded(status: Int, service: BluetoothGattService) = dispatch {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                releaseServer()
+                scheduleRetry("Heart rate service setup failed ($status)")
+            } else {
+                ready = true
+                ensureServerAndAdvertising()
+            }
+        }
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) = dispatch {
+            val address = device.address
+            if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+                devices[address] = device
+                val bonded = device.bondState == BluetoothDevice.BOND_BONDED
+                if (!bonded) preferences.edit().remove(address).apply()
+                subscriptions.connect(address, bonded && preferences.getBoolean(address, false))
+                Log.d(TAG, "Receiver connected; restored subscription=${subscriptions.subscribed(address)}")
+                // Keep one advertising instance alive, including while connected.
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                devices.remove(address)
+                subscriptions.disconnect(address)
+                Log.d(TAG, "Receiver disconnected; status=$status")
+                ensureServerAndAdvertising()
+            }
+            publishConnectionAndDemand()
+        }
+        override fun onDescriptorReadRequest(device: BluetoothDevice, requestId: Int,
+            offset: Int, descriptor: BluetoothGattDescriptor) = dispatch {
+            if (!isHeartRateCccd(descriptor)) {
+                respond(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, offset, null)
+            } else {
+                val value = if (subscriptions.subscribed(device.address)) byteArrayOf(1, 0) else byteArrayOf(0, 0)
+                if (offset !in 0..value.size) {
+                    respond(device, requestId, BluetoothGatt.GATT_INVALID_OFFSET, offset, null)
+                } else {
+                    respond(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value.copyOfRange(offset, value.size))
                 }
             }
         }
+        override fun onDescriptorWriteRequest(device: BluetoothDevice, requestId: Int,
+            descriptor: BluetoothGattDescriptor, preparedWrite: Boolean, responseNeeded: Boolean,
+            offset: Int, value: ByteArray) = dispatch {
+            val status = when {
+                !isHeartRateCccd(descriptor) || preparedWrite -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
+                offset != 0 -> BluetoothGatt.GATT_INVALID_OFFSET
+                value.size != 2 -> BluetoothGatt.GATT_INVALID_ATTRIBUTE_LENGTH
+                !value.contentEquals(byteArrayOf(0, 0)) && !value.contentEquals(byteArrayOf(1, 0)) -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
+                else -> BluetoothGatt.GATT_SUCCESS
+            }
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                devices[device.address] = device
+                subscriptions.subscribe(device.address, value[0].toInt() == 1)
+                if (device.bondState == BluetoothDevice.BOND_BONDED) {
+                    preferences.edit().putBoolean(device.address, subscriptions.subscribed(device.address)).apply()
+                }
+                Log.d(TAG, "Heart rate subscription=${subscriptions.subscribed(device.address)}")
+            }
+            // Acknowledge ATT before starting any sensor work.
+            if (responseNeeded) respond(device, requestId, status, offset, null)
+            if (status == BluetoothGatt.GATT_SUCCESS) publishConnectionAndDemand()
+        }
+        override fun onCharacteristicReadRequest(device: BluetoothDevice, requestId: Int,
+            offset: Int, characteristic: BluetoothGattCharacteristic) = dispatch {
+            respond(device, requestId, BluetoothGatt.GATT_READ_NOT_PERMITTED, offset, null)
+        }
+        override fun onExecuteWrite(device: BluetoothDevice, requestId: Int, execute: Boolean) = dispatch {
+            respond(device, requestId, BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED, 0, null)
+        }
+        override fun onNotificationSent(device: BluetoothDevice, status: Int) = dispatch {
+            if (status != BluetoothGatt.GATT_SUCCESS) Log.w(TAG, "Notification delivery failed: $status")
+        }
     }
 
-    private val advertiseCallback = object : AdvertiseCallback() {
-        override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
-            Log.d(TAG, "BLE Advertisement started successfully")
-            onAdvertisingStateChanged?.invoke(true)
-        }
+    private fun isHeartRateCccd(descriptor: BluetoothGattDescriptor) =
+        descriptor.uuid == HrmUuids.CCCD && descriptor.characteristic.uuid == HrmUuids.HR_MEASUREMENT &&
+            descriptor.characteristic.service.uuid == HrmUuids.HEART_RATE_SERVICE
 
-        override fun onStartFailure(errorCode: Int) {
-            Log.e(TAG, "BLE Advertisement failed with error code: $errorCode")
-            onAdvertisingStateChanged?.invoke(false)
-            onError?.invoke("Unable to start BLE advertising")
+    private fun respond(device: BluetoothDevice, id: Int, status: Int, offset: Int, value: ByteArray?) {
+        try { server?.sendResponse(device, id, status, offset, value) }
+        catch (e: SecurityException) { Log.w(TAG, "ATT response permission lost", e) }
+    }
+
+    private fun publishConnectionAndDemand() {
+        onConnectionStateChanged?.invoke(subscriptions.connected)
+        val demand = subscriptions.measurementNeeded
+        if (demand != lastDemand) {
+            lastDemand = demand
+            onMeasurementDemandChanged?.invoke(demand)
         }
     }
 
-    @SuppressLint("MissingPermission")
-    fun start(): Boolean {
-        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled) {
-            Log.e(TAG, "Bluetooth is disabled or not supported")
-            onAdvertisingStateChanged?.invoke(false)
-            onError?.invoke("Enable Bluetooth to broadcast heart rate")
-            return false
+    private fun startAdvertising() {
+        if (!wanted || !ready || advertisement != null) return
+        advertiser = adapter?.bluetoothLeAdvertiser
+        val currentAdvertiser = advertiser ?: run { scheduleRetry("BLE advertiser unavailable"); return }
+        val session = generation
+        val callback = object : AdvertiseCallback() {
+            override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
+                handler.post {
+                    if (session != generation || advertisement !== this || !wanted) return@post
+                    retryCount = 0
+                    Log.d(TAG, "BLE advertising ready")
+                    onAdvertisingStateChanged?.invoke(true)
+                }
+            }
+            override fun onStartFailure(errorCode: Int) {
+                handler.post {
+                    if (session != generation || advertisement !== this) return@post
+                    advertisement = null
+                    onAdvertisingStateChanged?.invoke(false)
+                    scheduleRetry("Retrying BLE advertising ($errorCode)")
+                }
+            }
         }
-
-        if (bluetoothLeAdvertiser == null) {
-            Log.e(TAG, "BLE advertising is not available")
-            onAdvertisingStateChanged?.invoke(false)
-            onError?.invoke("BLE advertising is unavailable on this watch")
-            return false
-        }
-
-        stop()
-        bluetoothGattServer = bluetoothManager.openGattServer(context, gattServerCallback)
-        if (bluetoothGattServer == null) {
-            Log.e(TAG, "Unable to open GATT server")
-            onAdvertisingStateChanged?.invoke(false)
-            onError?.invoke("Unable to open BLE server")
-            return false
-        }
-
-        if (!setupGattService()) {
-            stop()
-            return false
-        }
-        return startAdvertising()
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun setupGattService(): Boolean {
-        val hrmService = BluetoothGattService(HrmUuids.HEART_RATE_SERVICE, BluetoothGattService.SERVICE_TYPE_PRIMARY)
-        
-        val hrmCharacteristic = BluetoothGattCharacteristic(
-            HrmUuids.HR_MEASUREMENT,
-            BluetoothGattCharacteristic.PROPERTY_NOTIFY,
-            BluetoothGattCharacteristic.PERMISSION_READ
-        )
-
-        val cccd = BluetoothGattDescriptor(
-            HrmUuids.CCCD,
-            BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
-        )
-        
-        hrmCharacteristic.addDescriptor(cccd)
-        hrmService.addCharacteristic(hrmCharacteristic)
-        val added = bluetoothGattServer?.addService(hrmService) == true
-        if (!added) {
-            Log.e(TAG, "Unable to add heart rate GATT service")
-            onError?.invoke("Unable to publish BLE heart rate service")
-        }
-        return added
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun startAdvertising(): Boolean {
-        val advertiser = bluetoothLeAdvertiser
-        if (advertiser == null) {
-            Log.e(TAG, "BLE advertiser unavailable")
-            onAdvertisingStateChanged?.invoke(false)
-            onError?.invoke("BLE advertising is unavailable on this watch")
-            return false
-        }
-
-        val settings = AdvertiseSettings.Builder()
+        advertisement = callback
+        val settings = AdvertiseSettings.Builder().setConnectable(true).setTimeout(0)
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
-            .setConnectable(true)
-            .setTimeout(0)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
-            .build()
-
-        val data = AdvertiseData.Builder()
-            .setIncludeDeviceName(true)
-            .addServiceUuid(ParcelUuid(HrmUuids.HEART_RATE_SERVICE))
-            .build()
-
-        advertiser.startAdvertising(settings, data, advertiseCallback)
-        return true
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM).build()
+        val data = AdvertiseData.Builder().addServiceUuid(ParcelUuid(HrmUuids.HEART_RATE_SERVICE)).build()
+        val scanResponse = AdvertiseData.Builder().setIncludeDeviceName(true).build()
+        try { currentAdvertiser.startAdvertising(settings, data, scanResponse, callback) }
+        catch (e: RuntimeException) {
+            advertisement = null
+            Log.w(TAG, "Cannot advertise yet", e)
+            scheduleRetry("Waiting to resume BLE advertising")
+        }
     }
 
-    @SuppressLint("MissingPermission")
+    private fun scheduleRetry(message: String) {
+        if (!wanted) return
+        Log.w(TAG, message)
+        onError?.invoke(message)
+        handler.removeCallbacks(retry)
+        val delay = (1000L shl retryCount.coerceAtMost(5)).coerceAtMost(30_000L)
+        retryCount = (retryCount + 1).coerceAtMost(5)
+        handler.postDelayed(retry, delay)
+    }
+
     private fun stopAdvertising() {
-        bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
+        val callback = advertisement
+        advertisement = null
+        try { if (callback != null) advertiser?.stopAdvertising(callback) }
+        catch (e: RuntimeException) { Log.w(TAG, "Advertiser already unavailable", e) }
         onAdvertisingStateChanged?.invoke(false)
     }
 
-    @SuppressLint("MissingPermission")
-    fun stop() {
+    private fun releaseServer() {
+        generation++
+        ready = false
         stopAdvertising()
-        bluetoothGattServer?.close()
-        bluetoothGattServer = null
-        connectedDevice = null
-        notificationsEnabled = false
-        onMeasurementDemandChanged?.invoke(false)
+        val old = server
+        server = null
+        try { devices.values.forEach { old?.cancelConnection(it) } }
+        catch (e: RuntimeException) { Log.w(TAG, "Connections already unavailable", e) }
+        try { old?.close() }
+        catch (e: RuntimeException) { Log.w(TAG, "GATT server already unavailable", e) }
+        devices.clear()
+        subscriptions.clear()
+        publishConnectionAndDemand()
     }
 
-    @SuppressLint("MissingPermission")
     fun updateHeartRate(bpm: Int) {
-        val device = connectedDevice ?: return
-        if (!notificationsEnabled) return
-
-        val characteristic = bluetoothGattServer
-            ?.getService(HrmUuids.HEART_RATE_SERVICE)
+        val current = server ?: return
+        val characteristic = current.getService(HrmUuids.HEART_RATE_SERVICE)
             ?.getCharacteristic(HrmUuids.HR_MEASUREMENT) ?: return
-
-        // 0x2A37 packet: flags byte + BPM byte
-        // flags = 0x00 means BPM is UINT8 (valid up to 255 bpm)
-        val payload = byteArrayOf(0x00, bpm.toByte())
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            bluetoothGattServer?.notifyCharacteristicChanged(device, characteristic, false, payload)
-        } else {
-            @Suppress("DEPRECATION")
-            characteristic.value = payload
-            @Suppress("DEPRECATION")
-            bluetoothGattServer?.notifyCharacteristicChanged(device, characteristic, false)
+        val payload = byteArrayOf(0, bpm.coerceIn(0, 255).toByte())
+        for (address in subscriptions.subscribers) {
+            val device = devices[address] ?: continue
+            try {
+                if (Build.VERSION.SDK_INT >= 33) {
+                    val result = current.notifyCharacteristicChanged(device, characteristic, false, payload)
+                    if (result != BluetoothStatusCodes.SUCCESS) Log.w(TAG, "Notification rejected: $result")
+                } else {
+                    @Suppress("DEPRECATION")
+                    characteristic.value = payload
+                    @Suppress("DEPRECATION")
+                    current.notifyCharacteristicChanged(device, characteristic, false)
+                }
+            } catch (e: RuntimeException) { Log.w(TAG, "Notification unavailable", e) }
         }
     }
-
-    companion object {
-        private const val TAG = "BleHrmServer"
-    }
+    companion object { private const val TAG = "BleHrmServer" }
 }
+
