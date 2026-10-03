@@ -52,6 +52,13 @@ class HrmForegroundService : Service() {
     private val _sensorStatus = MutableStateFlow("Waiting for heart rate...")
     val sensorStatus = _sensorStatus.asStateFlow()
 
+    private val _pairingStatus = MutableStateFlow("Connect a receiver before pairing")
+    val pairingStatus = _pairingStatus.asStateFlow()
+    private val _canPairReceiver = MutableStateFlow(false)
+    val canPairReceiver = _canPairReceiver.asStateFlow()
+
+    fun pairReceiver() = bleHrmServer.pairReceiver()
+
     private val _isMeasuring = MutableStateFlow(false)
     val isMeasuring = _isMeasuring.asStateFlow()
 
@@ -111,6 +118,10 @@ class HrmForegroundService : Service() {
                     _heartRate.value = 0
                 }
                 refreshStatusMessage()
+            }
+            onPairingStateChanged = { message, canPair ->
+                _pairingStatus.value = message
+                _canPairReceiver.value = canPair
             }
             onError = { message ->
                 Log.w(TAG, message)
