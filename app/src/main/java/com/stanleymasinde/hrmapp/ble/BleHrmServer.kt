@@ -32,14 +32,60 @@ class BleHrmServer(private val context: Context) {
     private var receiverRegistered = false
     private var retryCount = 0
     private var lastDemand = false
+    private var pairingAddress: String? = null
+    private var pairingMessage: String? = null
+    private var pairingTimedOut = false
+    private val pairingTimeout = Runnable {
+        pairingTimedOut = true
+        val state = try { pairingAddress?.let { adapter?.getRemoteDevice(it)?.bondState } }
+            catch (_: RuntimeException) { null }
+        if (state == BluetoothDevice.BOND_BONDED) {
+            pairingAddress?.let { address ->
+                if (address in devices) preferences.edit()
+                    .putBoolean(address, subscriptions.subscribed(address)).apply()
+            }
+            pairingAddress = null
+            pairingMessage = "Paired; test reconnect after address changes"
+        } else {
+            if (state != BluetoothDevice.BOND_BONDING) pairingAddress = null
+            pairingMessage = if (state == BluetoothDevice.BOND_BONDING) {
+                "Pairing still pending; check both devices"
+            } else "Pairing timed out; check receiver support"
+            Log.w(TAG, "Receiver bonding timeout; state=$state")
+        }
+        publishPairingState()
+    }
     private val retry = Runnable { ensureServerAndAdvertising() }
     var onConnectionStateChanged: ((Boolean) -> Unit)? = null
     var onAdvertisingStateChanged: ((Boolean) -> Unit)? = null
     var onMeasurementDemandChanged: ((Boolean) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
+    var onPairingStateChanged: ((String, Boolean) -> Unit)? = null
 
     private val bluetoothStateReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == BluetoothDevice.ACTION_BOND_STATE_CHANGED) {
+                @Suppress("DEPRECATION")
+                val device = intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE) ?: return
+                val address = device.address
+                val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
+                if (state == BluetoothDevice.BOND_NONE) preferences.edit().remove(address).apply()
+                if (address !in devices && address != pairingAddress) return
+                Log.d(TAG, "Receiver bond state=$state")
+                if (state == BluetoothDevice.BOND_BONDED && address in devices) {
+                    // A receiver may subscribe before pairing completes.
+                    preferences.edit().putBoolean(address, subscriptions.subscribed(address)).apply()
+                }
+                if (address == pairingAddress && state != BluetoothDevice.BOND_BONDING) {
+                    handler.removeCallbacks(pairingTimeout)
+                    pairingAddress = null
+                    pairingMessage = if (state == BluetoothDevice.BOND_BONDED) {
+                        "Paired; test reconnect after address changes"
+                    } else "Pairing failed or cancelled; receiver may not support it"
+                }
+                publishPairingState()
+                return
+            }
             when (intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)) {
                 BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> {
                     releaseServer()
@@ -57,7 +103,9 @@ class BleHrmServer(private val context: Context) {
         try {
             if (!receiverRegistered) {
                 ContextCompat.registerReceiver(context, bluetoothStateReceiver,
-                    IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED), ContextCompat.RECEIVER_EXPORTED)
+                    IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED).apply {
+                        addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+                    }, ContextCompat.RECEIVER_EXPORTED)
                 receiverRegistered = true
             }
             publishConnectionAndDemand()
@@ -213,7 +261,61 @@ class BleHrmServer(private val context: Context) {
         catch (e: SecurityException) { Log.w(TAG, "ATT response permission lost", e) }
     }
 
+    /** Explicit user action only; never guess which of several receivers to pair. */
+    fun pairReceiver() {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        val device = subscriptions.subscribers.mapNotNull { devices[it] }.singleOrNull()
+        if (!wanted || device == null || pairingAddress != null) return
+        try {
+            if (device.bondState != BluetoothDevice.BOND_NONE) {
+                publishPairingState()
+                return
+            }
+            pairingAddress = device.address
+            pairingMessage = null
+            pairingTimedOut = false
+            handler.removeCallbacks(pairingTimeout)
+            handler.postDelayed(pairingTimeout, 60_000L)
+            // Public API: Android displays any required pairing confirmation.
+            // A true return only means the request started, not that it succeeded.
+            val accepted = device.createBond()
+            Log.d(TAG, "Receiver bonding requested; accepted=$accepted")
+            if (!accepted) {
+                handler.removeCallbacks(pairingTimeout)
+                pairingAddress = null
+                pairingMessage = "Could not start pairing; try while connected"
+            }
+        } catch (e: RuntimeException) {
+            handler.removeCallbacks(pairingTimeout)
+            pairingAddress = null
+            pairingMessage = "Pairing unavailable; check Nearby devices permission"
+            Log.w(TAG, "Receiver bonding unavailable", e)
+        }
+        publishPairingState()
+    }
+
+    private fun publishPairingState() {
+        val peers = subscriptions.subscribers.mapNotNull { devices[it] }
+        val device = peers.singleOrNull()
+        val bondState = try { device?.bondState } catch (_: SecurityException) { null }
+        val message = when {
+            pairingAddress != null && !pairingTimedOut -> "Pairing... confirm on both devices if asked"
+            pairingAddress != null -> pairingMessage ?: "Pairing still pending"
+            pairingMessage != null -> pairingMessage!!
+            !wanted -> "Pairing test: start broadcasting first"
+            peers.isEmpty() -> "Pairing test: connect a heart rate receiver first"
+            peers.size > 1 -> "Pairing test: keep only one receiver connected"
+            bondState == BluetoothDevice.BOND_BONDED -> "Receiver paired; test automatic reconnect"
+            bondState == BluetoothDevice.BOND_BONDING -> "System pairing in progress"
+            else -> "Pairing may let your receiver recognize changing addresses"
+        }
+        val canPair = wanted && peers.size == 1 && pairingAddress == null &&
+            bondState == BluetoothDevice.BOND_NONE
+        onPairingStateChanged?.invoke(message, canPair)
+    }
+
     private fun publishConnectionAndDemand() {
+        publishPairingState()
         onConnectionStateChanged?.invoke(subscriptions.connected)
         val demand = subscriptions.measurementNeeded
         if (demand != lastDemand) {
@@ -278,6 +380,9 @@ class BleHrmServer(private val context: Context) {
     }
 
     private fun releaseServer() {
+        handler.removeCallbacks(pairingTimeout)
+        pairingAddress = null
+        pairingMessage = null
         generation++
         ready = false
         stopAdvertising()
