@@ -98,6 +98,11 @@ fun MainScreen() {
     val isRunningState = hrmService?.isRunning?.collectAsState(initial = false)
     val isRunning = isRunningState?.value ?: false
 
+    val subscribedState = hrmService?.isSubscribed?.collectAsState(initial = false)
+    val isSubscribed = subscribedState?.value ?: false
+    val sensorState = hrmService?.sensorStatus?.collectAsState(initial = "Waiting for heart rate...")
+    val sensorStatus = sensorState?.value ?: "Waiting for heart rate..."
+
     val isMeasuringState = hrmService?.isMeasuring?.collectAsState(initial = false)
     val isMeasuring = isMeasuringState?.value ?: false
 
@@ -113,7 +118,9 @@ fun MainScreen() {
             .background(Color.Black)
     ) {
         val standardForeground = remember {
-            val list = mutableListOf(Manifest.permission.BODY_SENSORS)
+            val list = mutableListOf(if (Build.VERSION.SDK_INT >= 36) {
+                "android.permission.health.READ_HEART_RATE"
+            } else Manifest.permission.BODY_SENSORS)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 list.add(Manifest.permission.BLUETOOTH_ADVERTISE)
                 list.add(Manifest.permission.BLUETOOTH_CONNECT)
@@ -124,7 +131,9 @@ fun MainScreen() {
             list.toTypedArray()
         }
 
-        val backgroundPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val backgroundPermission = if (Build.VERSION.SDK_INT >= 36) {
+            "android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND"
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             "android.permission.BODY_SENSORS_BACKGROUND"
         } else {
             ""
@@ -134,7 +143,10 @@ fun MainScreen() {
             mutableStateOf(getPermissionMap(context, standardForeground, backgroundPermission))
         }
 
-        val foregroundGranted = standardForeground.all { permissionStatuses[it] == true }
+        val foregroundGranted = standardForeground.filter { it != Manifest.permission.POST_NOTIFICATIONS }
+            .all { permissionStatuses[it] == true }
+        val permissionPrefs = remember { context.getSharedPreferences("permission_requests", Context.MODE_PRIVATE) }
+        var backgroundRequested by remember { mutableStateOf(permissionPrefs.getBoolean(backgroundPermission, false)) }
         val backgroundGranted = if (backgroundPermission.isNotEmpty()) {
             permissionStatuses[backgroundPermission] == true
         } else {
@@ -193,14 +205,9 @@ fun MainScreen() {
 
                 if (isRunning) {
                     Text(
-                        text = when {
-                            !isMeasuring -> "Waiting for receiver subscription"
-                            heartRate > 0 -> "Sensor active"
-                            isSensorAvailable -> "Waiting for heart rate..."
-                            else -> "Check watch fit and sensor access"
-                        },
+                        text = if (!isSubscribed) "Waiting for receiver subscription" else sensorStatus,
                         style = MaterialTheme.typography.bodySmall,
-                        color = if (!isMeasuring) {
+                        color = if (!isSubscribed) {
                             Color.LightGray
                         } else if (heartRate > 0 || isSensorAvailable) {
                             Color(0xFF00E676)
@@ -247,26 +254,22 @@ fun MainScreen() {
                     }
                 } else {
                     Text(
-                        "Enable background sensor access in Settings before starting.",
+                        "Allow heart rate access in the background to keep broadcasting with the screen off.",
                         style = MaterialTheme.typography.bodyExtraSmall,
                         textAlign = TextAlign.Center,
                         color = Color.LightGray
                     )
                     Spacer(modifier = Modifier.height(8.dp))
                     Button(onClick = {
-                        if (backgroundPermission.isNotEmpty()) {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                openAppSettings(context)
-                            } else {
-                                backgroundLauncher.launch(backgroundPermission)
-                            }
+                        if (backgroundRequested) {
+                            openAppSettings(context)
+                        } else if (backgroundPermission.isNotEmpty()) {
+                            backgroundRequested = true
+                            permissionPrefs.edit().putBoolean(backgroundPermission, true).apply()
+                            backgroundLauncher.launch(backgroundPermission)
                         }
                     }) {
-                        Text(if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            "Open Settings"
-                        } else {
-                            "Allow All The Time"
-                        })
+                        Text(if (backgroundRequested) "Open Settings" else "Grant Background")
                     }
                 }
             }
