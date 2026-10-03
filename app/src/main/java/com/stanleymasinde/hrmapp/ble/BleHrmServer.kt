@@ -351,9 +351,10 @@ class BleHrmServer(private val context: Context) {
         val settings = AdvertiseSettings.Builder().setConnectable(true).setTimeout(0)
             .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM).build()
-        val data = AdvertiseData.Builder().addServiceUuid(ParcelUuid(HrmUuids.HEART_RATE_SERVICE)).build()
-        val scanResponse = AdvertiseData.Builder().setIncludeDeviceName(true).build()
-        try { currentAdvertiser.startAdvertising(settings, data, scanResponse, callback) }
+        // Match the original primary advertisement; Android still manages the BLE address.
+        val data = AdvertiseData.Builder().setIncludeDeviceName(true)
+            .addServiceUuid(ParcelUuid(HrmUuids.HEART_RATE_SERVICE)).build()
+        try { currentAdvertiser.startAdvertising(settings, data, callback) }
         catch (e: RuntimeException) {
             advertisement = null
             Log.w(TAG, "Cannot advertise yet", e)
