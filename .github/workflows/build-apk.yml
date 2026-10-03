@@ -37,11 +37,11 @@ jobs:
       - name: Verify and package APK
         run: |
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/HrmApp-1.2-bond-test.apk
+          cp app/build/outputs/apk/debug/app-debug.apk dist/HrmApp-1.3-name-test.apk
           cp LICENSE dist/LICENSE.txt
           cp app/build/test-results/testDebugUnitTest/TEST-*.xml dist/
-          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs dist/HrmApp-1.2-bond-test.apk | tee dist/signature-verification.txt
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging dist/HrmApp-1.2-bond-test.apk > dist/apk-info.txt
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs dist/HrmApp-1.3-name-test.apk | tee dist/signature-verification.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging dist/HrmApp-1.3-name-test.apk > dist/apk-info.txt
           {
             echo "Repository: $GITHUB_REPOSITORY"
             echo "Commit: $GITHUB_SHA"
@@ -49,13 +49,13 @@ jobs:
             echo "Build: signed debug APK for ADB sideloading"
             echo "Note: a fresh debug signing key is generated on each clean runner."
           } > dist/build-info.txt
-          (cd dist && sha256sum HrmApp-1.2-bond-test.apk > SHA256SUMS.txt)
+          (cd dist && sha256sum HrmApp-1.3-name-test.apk > SHA256SUMS.txt)
           cat dist/build-info.txt >> "$GITHUB_STEP_SUMMARY"
           cat dist/SHA256SUMS.txt >> "$GITHUB_STEP_SUMMARY"
       - name: Upload installable APK and verification reports
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: HrmApp-WearOS-bond-test
+          name: HrmApp-WearOS-name-test
           path: dist/
           if-no-files-found: error
           retention-days: 30
