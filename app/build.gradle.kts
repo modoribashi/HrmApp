@@ -10,9 +10,9 @@ android {
     defaultConfig {
         applicationId = "com.stanleymasinde.hrmapp"
         minSdk = 30
-        targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        targetSdk = 36
+        versionCode = 2
+        versionName = "1.1-reconnect"
     }
 
     buildTypes {
@@ -34,6 +34,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation(libs.play.services.wearable)
     implementation(platform(libs.compose.bom))
     implementation(libs.ui)
