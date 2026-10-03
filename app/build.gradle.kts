@@ -11,8 +11,8 @@ android {
         applicationId = "com.stanleymasinde.hrmapp"
         minSdk = 30
         targetSdk = 36
-        versionCode = 2
-        versionName = "1.1-reconnect"
+        versionCode = 3
+        versionName = "1.2-bond-test"
     }
 
     buildTypes {
