@@ -10,6 +10,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -21,6 +23,14 @@ import kotlinx.coroutines.flow.asStateFlow
 
 class HrmForegroundService : Service() {
 
+    private val handler = Handler(Looper.getMainLooper())
+    private var bleIssue: String? = null
+    private val staleSample = Runnable {
+        _heartRate.value = 0
+        _isSensorAvailable.value = false
+        _sensorStatus.value = "No recent heart rate; check watch fit"
+        refreshStatusMessage()
+    }
     private val binder = LocalBinder()
     private lateinit var bleHrmServer: BleHrmServer
     private lateinit var hrDataSource: HrDataSource
@@ -36,6 +46,11 @@ class HrmForegroundService : Service() {
 
     private val _isConnected = MutableStateFlow(false)
     val isConnected = _isConnected.asStateFlow()
+
+    private val _isSubscribed = MutableStateFlow(false)
+    val isSubscribed = _isSubscribed.asStateFlow()
+    private val _sensorStatus = MutableStateFlow("Waiting for heart rate...")
+    val sensorStatus = _sensorStatus.asStateFlow()
 
     private val _isMeasuring = MutableStateFlow(false)
     val isMeasuring = _isMeasuring.asStateFlow()
@@ -85,51 +100,46 @@ class HrmForegroundService : Service() {
             }
             onAdvertisingStateChanged = { advertising ->
                 _isAdvertising.value = advertising
+                if (advertising) bleIssue = null
                 refreshStatusMessage()
             }
             onMeasurementDemandChanged = { demanded ->
-                if (demanded) {
-                    val hrStarted = hrDataSource.start()
-                    if (hrStarted) {
-                        _isMeasuring.value = true
-                        refreshStatusMessage()
-                    } else {
-                        handleStartupFailure()
-                    }
-                } else {
-                    _isMeasuring.value = false
-                    _isSensorAvailable.value = false
-                    _heartRate.value = 0
+                _isSubscribed.value = demanded
+                if (demanded) hrDataSource.start() else {
                     hrDataSource.stop()
-                    refreshStatusMessage()
-                    updateNotification(0)
+                    handler.removeCallbacks(staleSample)
+                    _heartRate.value = 0
                 }
+                refreshStatusMessage()
             }
             onError = { message ->
-                Log.e(TAG, message)
-                _statusMessage.value = message
-                _isRunning.value = false
-                _isAdvertising.value = false
-                handleStartupFailure()
+                Log.w(TAG, message)
+                bleIssue = message
+                refreshStatusMessage()
             }
         }
         hrDataSource = HrDataSource(
             context = this,
             onHeartRateChanged = { bpm ->
-                Log.d(TAG, "Callback received BPM: $bpm")
-                _heartRate.value = bpm
-                bleHrmServer.updateHeartRate(bpm)
-                refreshStatusMessage()
-                updateNotification(bpm)
-            },
-            onError = { message ->
-                Log.e(TAG, message)
-                if (_heartRate.value == 0) {
-                    _statusMessage.value = message
+                if (_isRunning.value && _isSubscribed.value) {
+                    _heartRate.value = bpm
+                    bleHrmServer.updateHeartRate(bpm)
+                    handler.removeCallbacks(staleSample)
+                    handler.postDelayed(staleSample, 10_000L)
+                    refreshStatusMessage()
                 }
+            },
+            onRegistrationChanged = { registered ->
+                _isMeasuring.value = registered
+                refreshStatusMessage()
+            },
+            onStatusChanged = { message ->
+                _sensorStatus.value = message
+                refreshStatusMessage()
             },
             onAvailabilityChanged = { available ->
                 _isSensorAvailable.value = available
+                if (!available) _heartRate.value = 0
                 refreshStatusMessage()
             },
         )
@@ -137,29 +147,31 @@ class HrmForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> {
-                Log.d(TAG, "Starting HRM Service")
-                startForegroundServiceInternal()
-                _heartRate.value = 0
-                _isConnected.value = false
-                _isAdvertising.value = false
-                _isMeasuring.value = false
-                _isSensorAvailable.value = false
-                val bleStarted = bleHrmServer.start()
-                if (bleStarted) {
-                    _isRunning.value = true
+            ACTION_START, null -> {
+                // A system restart can resume an active session; explicit Stop cannot.
+                try {
+                    startForegroundServiceInternal()
+                    if (!_isRunning.value) {
+                        _isRunning.value = true
+                        bleIssue = null
+                        if (!bleHrmServer.start()) {
+                            handleStartupFailure()
+                            return START_NOT_STICKY
+                        }
+                    }
                     refreshStatusMessage()
-                } else {
+                } catch (e: RuntimeException) {
+                    Log.e(TAG, "Unable to start foreground session", e)
                     handleStartupFailure()
+                    _statusMessage.value = "Open app and grant required permissions"
                 }
             }
             ACTION_STOP -> {
-                Log.d(TAG, "Stopping HRM Service")
                 stopWork()
                 stopSelf()
             }
         }
-        return START_NOT_STICKY
+        return if (_isRunning.value) START_STICKY else START_NOT_STICKY
     }
 
     private fun startForegroundServiceInternal() {
@@ -188,7 +200,7 @@ class HrmForegroundService : Service() {
         val contentText = when {
             bpm > 0 -> "Current HR: $bpm BPM"
             !_isConnected.value -> "Waiting for receiver..."
-            !_isMeasuring.value -> "Waiting for receiver subscription..."
+            !_isSubscribed.value -> "Waiting for receiver subscription..."
             else -> "Waiting for heart rate..."
         }
         
@@ -217,49 +229,36 @@ class HrmForegroundService : Service() {
     }
 
     private fun stopWork() {
-        Log.d(TAG, "Stopping work")
         _isRunning.value = false
-        _isAdvertising.value = false
-        _isConnected.value = false
-        _isMeasuring.value = false
-        _isSensorAvailable.value = false
-        _heartRate.value = 0
-        refreshStatusMessage()
+        handler.removeCallbacks(staleSample)
         bleHrmServer.stop()
         hrDataSource.stop()
+        _isSubscribed.value = false
+        _heartRate.value = 0
+        bleIssue = null
+        refreshStatusMessage()
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
     private fun handleStartupFailure() {
-        _isRunning.value = false
-        _isAdvertising.value = false
-        _isConnected.value = false
-        _isMeasuring.value = false
-        _isSensorAvailable.value = false
-        _heartRate.value = 0
-        bleHrmServer.stop()
-        hrDataSource.stop()
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopWork()
         stopSelf()
     }
 
     private fun refreshStatusMessage() {
         _statusMessage.value = when {
             !_isRunning.value -> "Ready to broadcast"
-            !_isConnected.value -> {
-                if (_isAdvertising.value) "Advertising BLE..." else "Preparing BLE..."
-            }
-            !_isMeasuring.value -> "Connected, waiting for receiver"
-            _heartRate.value > 0 || _isSensorAvailable.value -> {
-                if (_isConnected.value) "Connected to receiver" else "Advertising BLE..."
-            }
-            else -> "Preparing BLE..."
+            bleIssue != null -> bleIssue!!
+            !_isConnected.value -> if (_isAdvertising.value) "Advertising BLE..." else "Preparing BLE..."
+            !_isSubscribed.value -> "Connected, not subscribed"
+            else -> "Receiver subscribed"
         }
+        if (_isRunning.value) updateNotification(_heartRate.value)
     }
 
     override fun onDestroy() {
-        Log.d(TAG, "Service destroyed")
         stopWork()
+        bleHrmServer.close()
         super.onDestroy()
     }
 }
